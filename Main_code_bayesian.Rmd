@@ -1,0 +1,659 @@
+## 1. Setup
+```{r}
+library("sf")
+library("tmap")
+library("spdep")
+library("rstan")
+library("geostan")
+library("SpatialEpi")
+library("tidybayes")
+library("tidyverse")
+library("loo")
+library("MASS")
+library("units")
+library("ggspatial")
+
+options(mc.cores = 4) #Setting the cores in the computer for parallel processing to 4 only to avoid crashing the laptop
+rstan_options(auto_write = TRUE)
+
+#Setting up the working directory
+setwd("C:/Users/ACER/Documents/Term 2 - SGDS - UCL/GEOG0125-Advanced Topics in Social Geographic Data Science/final-bayesian")
+
+#source: (Musah, 2025b)
+```
+
+In this step, shapefiles were filtered to include only the main Jakarta area and then alphabetically ordered to ensure consistency during the merging process. Shapefiles for Jakarta’s main districts were also loaded for use in subsequent visualizations.
+```{r}
+#Shapefiles for Jakarta District (wards) which is the main focus area
+jakarta_district<-st_read("gadm41_IDN_4.json")%>%
+  filter(NAME_1=="JakartaRaya" & NAME_2!="KepulauanSeribu")%>%
+  mutate(NAME_4=tolower(NAME_4))%>%
+  dplyr::select(c(NAME_4,NAME_3,NAME_2,geometry))%>%
+  distinct()
+
+jakarta_district <- jakarta_district %>%
+  arrange(NAME_4) #This part sorts the jakarta_district data alphabetically
+rownames(jakarta_district) <- NULL #removes the row names
+jakarta_district<-jakarta_district%>%
+filter(!NAME_4 %in% "danausunter") #take out one lake in Jakarta
+
+#Shapefiles for Jakarta Main Districts
+jakarta_main <- st_read('jakarta_main district_fixed.gpkg')
+jakarta_main <- jakarta_main %>%
+  arrange(NAME_2) #This part sorts the jakarta_district data alphabetically
+rownames(jakarta_main) <- NULL #removes the row names
+
+```
+
+This section presents the variables used in the analysis. The dependent variable is the number of people affected by floods in Jakarta in 2020 (flood_2020), measured at the ward level across the mainland. The independent variables include the 2020 social vulnerability index (social_index_2020), which reflects poverty levels by ward, and an environmental and health vulnerability index. The latter is constructed from four indicators: the presence of blocked water channels, garbage accumulation, and the proportion of households residing along riverbanks
+```{r}
+#Dependent Variable
+flood_2020<-read.csv('Data/Flood data by ward - data.csv')%>%
+  filter(!Wards %in% c("pulautidung", "pulaupari", "pulauuntungjawa", "pulaukelapa", "pulauharapan", "pulaupanggang"))
+#source: https://satudata.jakarta.go.id/open-data/detail?kategori=dataset&page_url=data-kejadian-bencana-banjir-di-provinsi-dki-jakarta-tahun-2020&data_no=1
+#Note: This data set has been manually process in excel to smoothen the coding process
+  	
+#Independent Variables
+social_index_2020<-read.csv('Data/Jakarta Province Social Vulnerability Potential Index, Dki Jakarta Province Central Statistics Agency 2020.csv')%>%
+  filter(!Ward %in% c("pulautidung", "pulaupari", "pulauuntungjawa", "pulaukelapa", "pulauharapan", "pulaupanggang"))
+#source: https://jakarta.bps.go.id/id/publication/2022/06/09/e87d41b4f941968d011c2b60/indeks-potensi-kerawanan-sosial-provinsi-dki-jakarta-2020-.html
+#Note: This data set has been manually extracted from pdf files into an excel format
+
+population_2020<-read.csv('Data/Number of Jakarta Population per Ward in 2020.csv')%>%
+  filter(!Ward %in% c("pulautidung", "pulaupari", "pulauuntungjawa", "pulaukelapa", "pulauharapan", "pulaupanggang"))
+#source: https://drive.google.com/file/d/1xoAJCuZeZ4FJaihsfIeBnX-tEvYfUC0h/view
+#Note: This dataset represents Indonesians residing in Jakarta in 2020. However, the documentation does not clarify whether the data reflects only the population as of December 31 or the total unique number of Indonesians who stayed in Jakarta throughout 2020.
+```
+
+## 2. Data Wrangling and Computing expected number
+
+To estimate the risk of flood-impacted populations, it is necessary to first calculate the expected number of affected individuals. This is done by multiplying the population size of each ward by the overall flood incidence rate. The resulting expected count serves as a balancing factor to ensure that wards with larger populations are not automatically assigned higher risk, allowing for a more accurate and equitable risk assessment.
+
+source: (Musah, 2025b)
+```{r}
+# Combining all variables into combined dataset
+combined_dataset<-flood_2020%>%
+  left_join(population_2020, by = c("Wards" = "Ward")) %>%
+  left_join(social_index_2020, by = c("Wards" = "Ward"))
+  
+
+combined_dataset$Total.Population <- as.numeric(combined_dataset$Total.Population) #converts the column to numeric format
+combined_dataset$Affected.people.by.the.flood <- as.numeric(combined_dataset$Affected.people.by.the.flood) #converts the column to numeric format
+combined_dataset$expected <- round(expected(population = combined_dataset$Total.Population, cases = combined_dataset$Affected.people.by.the.flood, n.strata = 1), 0) #calculating expected number
+
+combined_dataset <- combined_dataset %>%
+  janitor::clean_names() %>%
+  dplyr::select(wards, 
+         affected_people_by_the_flood, 
+         total_population, 
+         expected, 
+         poverty_prone_index, 
+         environmental_and_health_vulnerability_index)
+
+combined_dataset<-jakarta_district%>%
+  left_join(combined_dataset, by = c("NAME_4" = "wards"))%>%
+  st_as_sf()%>%
+  st_transform(crs = 5330) %>%
+   mutate(
+    area_m2 = st_area(geometry),
+    area_km2 = set_units(area_m2, km^2),               
+    area_km2 = drop_units(area_km2),                   
+    pop_density = total_population / area_km2) #calculating population density as part of one of the variables
+
+combined_dataset <- combined_dataset %>%
+  dplyr::rename(wards = NAME_4)%>%
+  janitor::clean_names() %>%
+  st_drop_geometry()%>%
+  dplyr::select(wards, 
+         affected_people_by_the_flood, 
+         total_population, 
+         expected,
+         pop_density,
+         poverty_prone_index, 
+         environmental_and_health_vulnerability_index)
+
+#(OpenAI, 2025)
+
+```
+
+This section examines the correlation among independent variables, revealing no strong multicollinearity
+```{r}
+overall_metrics_matrix <- combined_dataset %>%
+  st_drop_geometry() %>%
+  dplyr::select(poverty_prone_index, 
+    environmental_and_health_vulnerability_index
+  )
+
+cor_matrix <- cor(overall_metrics_matrix, method = "pearson")
+print(cor_matrix)
+
+#(MacLachlan and Dennett, 2022)
+```
+
+
+## 3, ICAR Model
+The model used in this study is the multivariable Besag, York, and Mollié (BYM) model, a lognormal Poisson regression that incorporates both spatial and non-spatial components. Specifically, it includes an Intrinsic Conditional Auto-Regressive (ICAR) term to account for spatial autocorrelation, and an unstructured random-effects term to capture non-spatial heterogeneity (Morris et al., 2019). The model estimates the unknown log-relative risk, allowing each area to "borrow strength" globally via the normal prior on unstructured effects and locally through the ICAR prior on spatial effects (Law, 2016; Duncan, White, & Mengersen, 2017). Due to its interpretability and computational efficiency, the BYM model is widely used in Bayesian frameworks to assess excess risk across spatial units (Nayak et al., 2020; Quick, Song, & Tabb, 2021).
+
+This study aims to assess the risk of flood-affected populations across wards in Jakarta by incorporating key socioeconomic factors. These include poverty levels, represented by the Poverty-Prone Index, and environmental vulnerabilities such as blocked water channels, garbage accumulation, and riverside settlements, which are combined into an Environmental and Health Vulnerability Index.
+
+To implement the model, a spatial structure of nodes and edges was generated at the ward level using a queen contiguity matrix.
+```{r}
+jakarta_district_spobject <- as(jakarta_district, "Spatial") #convert into a spatial object
+adjacencyMatrix <- shape2mat(jakarta_district_spobject) #preparing adjacency matrix object from the wards in Jakarta
+extractComponents <- prep_icar_data(adjacencyMatrix) # extract the necessary components for the ICAR model
+
+n <- as.numeric(extractComponents$group_size) #the areal units
+nod1 <- extractComponents$node1 #index of the region of interest
+nod2 <- extractComponents$node2 #wards that are connected to the index
+n_edges <- as.numeric(extractComponents$n_edges)#network of adjacency matrix using the queen contiguity matrix 
+
+
+y=combined_dataset$affected_people_by_the_flood #dependent variable
+x = combined_dataset[, c("poverty_prone_index", "environmental_and_health_vulnerability_index")] # matrix of the independent variables
+e=combined_dataset$expected #expected number as offset
+
+stan.spatial.baseline <- list(N=n, N_edges=n_edges, node1=nod1, node2=nod2, Y=y, X=x, K=length(x), off_set=e) #list of all of the components that will be passed to Stan
+
+#source: (Musah, 2025b)
+```
+
+The BYM model incorporates both spatial and non-spatial error terms to address over-dispersion. To balance the contributions of these components, gamma priors with parameters β(0.5, 0.5) are applied, ensuring equal emphasis on spatial and non-spatial variance (Morris et al., 2019). To regularize the model, weakly informative priors of Normal(0, 1) are used for dependent variable, covariates, and error terms (Lemoine, 2019; Gelman, 2025; Li et al., 2022; Nayak et al., 2020; Musah, 2025a). Posterior distributions of spatial effects and model parameters are estimated using Markov Chain Monte Carlo (MCMC) methods, with 4,000 iterations across 4 chains only, due to limited computational resources (Wang, 2022; Keefe, Ferreira & Franck, 2018).
+```{r}
+ptm <- proc.time()
+
+# Bayesian model
+Bayesian.model.baseline = stan("GEOG0125-Bayesian-Exam.stan", 
+    data=stan.spatial.baseline, 
+    iter=4000, chains=4, verbose = FALSE, 
+    control = list(max_treedepth = 12))
+
+proc.time() - ptm
+
+#source: (Musah, 2025b)
+```
+
+
+### 3.1 Diagnostic
+
+After running the ICAR model, diagnostic checks were conducted prior to interpreting the results. First, all parameters were assessed using the Gelman-Rubin statistic (r̂), with a threshold of 1.05, above which convergence is considered insufficient. Values exceeding this threshold indicate that the Markov chains did not converge to a plausible posterior distribution. The second diagnostic involved evaluating the proportion of non-convergent samples, which should remain below 10%.
+
+The diagnostics showed satisfactory performance, with all r̂ values below 1.05, indicating good convergence across all chains. #source: (Musah, 2025b)
+```{r}
+# diagnostic check 1: rHATs < 1.05
+diagnostic.checks <- as.data.frame(
+    summary(Bayesian.model.baseline, pars=c("alpha", "beta", "rr_alpha", "rr_beta", "rr_mu", "sigma", "phi", "lp__"), 
+        probs=c(0.025, 0.5, 0.975))$summary
+    )
+
+# create binary variables to check the rHATs are below 1.05
+diagnostic.checks$valid <- ifelse(diagnostic.checks$Rhat < 1.05, 1, 0)
+table(diagnostic.checks$valid)
+
+#source: (Musah, 2025b)
+```
+Furthermore, the second diagnostic showed that the samples that did not converge does not exceed 10%. which means the model also passed on this second diagnostic #source: (Musah, 2025b)
+```{r}
+# diagnostic check 2: check across each chains for samples that have diverged
+d1 <- get_sampler_params(Bayesian.model.baseline, inc_warmup = F)[[1]][, 'divergent__'] %>% sum() # chain 1
+d2 <- get_sampler_params(Bayesian.model.baseline, inc_warmup = F)[[2]][, 'divergent__'] %>% sum() # chain 2
+d3 <- get_sampler_params(Bayesian.model.baseline, inc_warmup = F)[[3]][, 'divergent__'] %>% sum() # chain 3
+d4 <- get_sampler_params(Bayesian.model.baseline, inc_warmup = F)[[4]][, 'divergent__'] %>% sum() # chain 4
+
+
+d1
+d2
+d3
+d4
+
+
+# Check the proportion of diverged samples is greater than 10
+(d1+d2+d3+d4)/8000 * 100 > 10
+
+#source: (Musah, 2025b)
+```
+
+### 3.2 Results Extraction
+
+Model results indicated that the average number of people affected by the 2020 Jakarta flood was –3.76, with a relative risk of 0.03 (95% CrI: 0.01–0.08). This suggests that flood risk was approximately 97.67% lower than the global average. The result is statistically significant, with a near-zero probability of excess risk.
+
+Regarding the poverty index, areas with higher poverty levels showed a 0.038 average decrease (95% CrI: 0.92–1.00) in flood-affected populations. This corresponds to a relative risk of 0.96 (4% lower), with a 3% probability of excess risk. However, this result is not statistically significant, as the credible interval includes the null value (RR = 1).
+
+For the environmental and health vulnerability index, the analysis shows an average decrease of 0.063 (95% CrI: 0.88–0.99), with a relative risk of 0.94 (6% lower) and a 3% probability of excess risk. This suggests that individuals residing in wards with lower environmental vulnerability may have a slightly higher likelihood of being affected by floods. Although statistically significant, the result is close to the threshold of non-significance.
+
+At first glance, the results appear counterintuitive. Although 2020 was one of Jakarta’s most severe flood years, the model indicates a 97% lower risk of flood impact on the population, particularly in areas with higher poverty and environmental vulnerability indices. These findings should be interpreted as exploratory. While they suggest that, at a broader scale, Jakarta exhibited lower flood-related risk and reduced exposure in socio-environmentally vulnerable areas, local variations reveal a more complex picture. This highlights the potential influence of other confounding factors that may shape flood risk patterns at both global and local levels in Jakarta during 2020.
+
+Figure 1 indicates that the highest number of people affected by flooding is concentrated in East Jakarta, with the top four most impacted ward located in this region. Figure 2 further highlights that the areas with the highest relative risk are primarily situated in East Jakarta. Furthermore, figure 3 demonstrates that the majority of wards experienced a statistically significant decrease in flood risk, reinforcing the broader trends discussed in the earlier section.
+
+Figure 4 illustrates exceedance probabilities, representing the likelihood that an areal unit’s estimated relative risk surpasses a specified threshold. For this analysis, a local threshold of 1.3 (or 30% higher risk than the baseline) was applied. This threshold is based on a research by Ban et al. (2023), who reported a relative risk of 1.3 for flood-related mortality (with a two-day lag) in North Carolina, USA. When this benchmark is applied, both Figure 4 and Table 2 show that areas with high exceedance probabilities for relative risk ≥ 1.3 are notably concentrated in East Jakarta and South Jakarta.
+
+While poverty and environmental vulnerability are often linked to higher flood risk, this study found that these factors did not significantly explain flood exposure in 2020. In that year, extreme rainfall caused river overcapacity, and the absence of adequate bypass infrastructure in Jakarta’s major rivers likely intensified flood impacts (Prabowo & Meiliana, 2020; Tempo, 2020; Gatra, 2020). Although the environmental index included the number of houses built along rivers, it may not have captured river type or infrastructure quality, thus limiting its explanatory value. As a result, even wealthier wards experienced considerable flood exposure due to infrastructure limitations and widespread rainfall.
+
+This study provides exploratory insights that can guide future research and urban policy. Notably, it emphasizes the need to reassess perceived risk. The Bayesian analysis reveals that areas appearing low-risk based on deprivation or environmental indicators may, in fact, require urgent attention. In the case of Jakarta in 2020, parts of East and South Jakarta may benefit from targeted interventions such as improved drainage, green infrastructure, and enhanced flood prevention systems.
+
+```{r}
+#summary table
+options(scipen = 999)
+summary(Bayesian.model.baseline, pars=c("alpha", "beta", "sigma"), probs=c(0.025, 0.975))$summary
+
+print(Bayesian.model.baseline, 
+    pars=c("rr_alpha", "rr_beta", "sigma"), 
+    probs=c(0.025, 0.975)
+)
+
+#intercepts
+threshold.intercept <- function(x){mean(x > 1.00)} # function to compute risk that is greater than 1.00
+rr_alpha.exc.probs <- Bayesian.model.baseline %>% spread_draws(rr_alpha) %>% 
+    summarise(rr_alpha=threshold.intercept(rr_alpha)) %>% # execute the function
+    pull(rr_alpha)
+
+#coefficients
+threshold.coefficients <- function(x){mean(x > 1.00)} # function to compute risk that is greater than 1.00
+rr_beta.exc.probs <- Bayesian.model.baseline %>% spread_draws(rr_beta[i]) %>% 
+    group_by(i) %>% summarise(rr_beta=threshold.coefficients(rr_beta)) %>% # execute the function
+    pull(rr_beta)
+
+# reports relative risks
+rr_alpha.exc.probs
+rr_beta.exc.probs
+
+#source: (Musah, 2025b)
+```
+Cleaning the results
+```{r}
+# creating a table
+names <- c("Baseline Risk","poverty_prone_index", "environmental_and_health_vulnerability_index")
+results <- as.data.frame(summary(Bayesian.model.baseline, pars = c("rr_alpha", "rr_beta"), probs = c(0.025, 0.975))$summary) #pulls summary statistics from your posterior distribution
+results$variables <- names
+row.names(results) <- 1:nrow(results) #pull the global relative risk in result object
+
+# Cleaning the tables
+results <- results[,c(8, 1, 4, 5, 6, 7)]
+results$mean <- round(results$mean, 4)
+colnames(results)[2] <- "coefficient"
+colnames(results)[3] <- "lower95"
+colnames(results)[4] <- "upper95"
+colnames(results)[5] <- "ess"
+colnames(results)[6] <- "rhat"
+results$lower95<- round(results$lower95, 4)
+results$upper95 <- round(results$upper95, 4)
+results$ess <- round(results$ess, 0)
+results$rhat <- round(results$rhat, 4)
+results$beta_95CrI <- paste(results$coefficient, " (95% CrI: ", results$lower95, " to ", results$upper95, ")", sep = "") # credibility results
+
+#source: (Musah, 2025b)
+```
+
+
+```{r}
+a <- c(rr_alpha.exc.probs, rr_beta.exc.probs) 
+results$ExceedanceProb <- round(a, 4)
+results$Uncertainty <- paste("Prob = ", results$ExceedanceProb, sep = "") #pull the exceedance probabilities into the result table
+final.output <- results[,c(1, 7, 9, 5, 6)] 
+final.output
+
+#source: (Musah, 2025b)
+```
+
+```{r}
+# Now export Global table results into a .csv file
+write.csv(final.output, file = "Global_Result_final.csv", row.names = FALSE)
+```
+
+## 4. Visualisation
+
+In terms of preparing for visualisation, it is necessary to pull the posterior summary statistics and then clean up again the order and name of the columns. After that, I also need to prepare the categories of relative risk, significance categories, and exceedance probabilities
+```{r}
+# pull posterior summary statistics
+relativeRisk.results <- as.data.frame(summary(Bayesian.model.baseline, pars=c("rr_mu"), probs=c(0.025, 0.975))$summary)
+
+#reseting index, reordering columns, and renaming columns
+row.names(relativeRisk.results) <- 1:nrow(relativeRisk.results)
+relativeRisk.results <- relativeRisk.results[, c(1,4,5,7)]
+colnames(relativeRisk.results)[1] <- "rr"
+colnames(relativeRisk.results)[2] <- "rrlower"
+colnames(relativeRisk.results)[3] <- "rrupper"
+colnames(relativeRisk.results)[4] <- "rHAT"
+
+#source: (Musah, 2025b)
+```
+
+
+```{r}
+# merging spatial risk data
+spatial.data <- jakarta_district
+spatial.data$rr <- relativeRisk.results[, "rr"]
+spatial.data$rrlower <- relativeRisk.results[, "rrlower"]
+spatial.data$rrupper <- relativeRisk.results[, "rrupper"]
+#source: (Musah, 2025b)
+```
+
+```{r}
+# create categories to define if an area has significant increase or decrease in risk, or nothing all 
+spatial.data$Significance <- NA
+spatial.data$Significance[spatial.data$rrlower<1 & spatial.data$rrupper>1] <- 0    # NOT SIGNIFICANT
+spatial.data$Significance[spatial.data$rrlower==1 | spatial.data$rrupper==1] <- 0  # NOT SIGNIFICANT
+spatial.data$Significance[spatial.data$rrlower>1 & spatial.data$rrupper>1] <- 1    # SIGNIFICANT INCREASE
+spatial.data$Significance[spatial.data$rrlower<1 & spatial.data$rrupper<1] <- -1   # SIGNIFICANT DECREASE
+
+# create categories for relative risk
+RiskCategorylist <- c(">0.0 to 0.25", "0.26 to 0.50", "0.51 to 0.75", "0.76 to 0.99", "1.00 & <1.01",
+    "1.01 to 1.10", "1.11 to 1.25", "1.26 to 1.50", "1.51 to 1.75", "1.76 to 2.00", "2.01 to 3.00")
+
+RRPalette <- c(
+  "#65bafe",
+  "#89c9fe",
+  "#98cffe",
+  "#addbfd",
+  "#cbe6fe",
+  "#dfeffe",
+  "white",  
+  "#fed5d5",
+  "#fcbba1",
+  "#fc9272",
+  "#fb6a4a",
+  "#de2d26",
+  "#f0302b" 
+)
+
+# categorising the risk values to match the labelling in Risk Categorylist object
+spatial.data$RelativeRiskCat <- NA
+spatial.data$RelativeRiskCat[spatial.data$rr>= 0 & spatial.data$rr <= 0.25] <- -4
+spatial.data$RelativeRiskCat[spatial.data$rr> 0.25 & spatial.data$rr <= 0.50] <- -3
+spatial.data$RelativeRiskCat[spatial.data$rr> 0.50 & spatial.data$rr <= 0.75] <- -2
+spatial.data$RelativeRiskCat[spatial.data$rr> 0.75 & spatial.data$rr < 1] <- -1
+spatial.data$RelativeRiskCat[spatial.data$rr>= 1.00 & spatial.data$rr < 1.01] <- 0
+spatial.data$RelativeRiskCat[spatial.data$rr>= 1.01 & spatial.data$rr <= 1.10] <- 1
+spatial.data$RelativeRiskCat[spatial.data$rr> 1.10 & spatial.data$rr <= 1.25] <- 2
+spatial.data$RelativeRiskCat[spatial.data$rr> 1.25 & spatial.data$rr <= 1.50] <- 3
+spatial.data$RelativeRiskCat[spatial.data$rr> 1.50 & spatial.data$rr <= 1.75] <- 4
+spatial.data$RelativeRiskCat[spatial.data$rr> 1.75 & spatial.data$rr <= 2.00] <- 5
+spatial.data$RelativeRiskCat[spatial.data$rr> 2.00 & spatial.data$rr <= 2.25] <- 6
+spatial.data$RelativeRiskCat[spatial.data$rr> 2.25 & spatial.data$rr <= 2.50] <- 7
+spatial.data$RelativeRiskCat[spatial.data$rr> 2.5] <- 8
+
+# pull posterior exceedance probabilities
+threshold <- function(x){mean(x > 1.30)} #relative risk based on Ban et al. (2023)
+excProbrr <- Bayesian.model.baseline %>% spread_draws(rr_mu[i]) %>% 
+    group_by(i) %>% summarise(rr_mu=threshold(rr_mu)) %>%
+    pull(rr_mu)
+
+# insert the exceedance values into the spatial data frame
+spatial.data$excProb <- excProbrr
+
+# categorising the probabilities in bands of 10s
+spatial.data$ProbCat <- NA
+spatial.data$ProbCat[spatial.data$excProb>=0 & spatial.data$excProb< 0.01] <- 1
+spatial.data$ProbCat[spatial.data$excProb>=0.01 & spatial.data$excProb< 0.50] <- 2
+spatial.data$ProbCat[spatial.data$excProb>=0.50 & spatial.data$excProb< 1.00] <- 3
+spatial.data$ProbCat[spatial.data$excProb == 1.00] <- 4
+
+# create the map labels for the probabilities
+ProbCategorylist <- c("<0.01", "0.01-0.09", "0.10-0.19", "0.20-0.29", "0.30-0.39", "0.40-0.49","0.50-0.59", "0.60-0.69", "0.70-0.79", "0.80-0.89", "0.90-0.99", "1.00")
+
+#source: (Musah, 2025b)
+```
+
+
+```{r}
+combined_dataset_vis<-combined_dataset%>%
+  left_join(jakarta_district, by = c("wards"="NAME_4"))%>%
+  st_as_sf()%>%
+  st_transform(crs = 5330)
+color_palette <- colorRampPalette(c("#ffffff", "#FFA500", "#ff0000"))(9)
+
+
+positivecase_map<-ggplot() + geom_sf(data = combined_dataset_vis, aes(fill = affected_people_by_the_flood), color = scales::alpha("black", 0.2), size = 1) +
+  geom_sf(data = jakarta_main, fill = NA, color = "black", size = 50, linetype = "solid") +
+  geom_sf_text(data = jakarta_main, aes(label = NAME_2), size = 4.5, color = "black", fontface = "bold")+
+  scale_fill_gradientn(
+    colors = color_palette, 
+    name = "People Affected", 
+    breaks = pretty(combined_dataset_vis$affected_people_by_the_flood, n = 5), 
+    labels = pretty(combined_dataset_vis$affected_people_by_the_flood, n = 5)
+  ) +
+  annotation_scale(
+    location = "bl",  
+    width_hint = 0.5  
+  ) +
+  annotation_north_arrow(
+    location = "bl",  
+    which_north = "true", 
+    pad_x = unit(0.8, "cm"),  
+    pad_y = unit(0.8, "cm"),  
+    style = north_arrow_fancy_orienteering 
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 13, hjust = 0.5, face = "bold"), 
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 11),
+    legend.position = "right", 
+    legend.key.size = unit(0.8, "cm"),
+    axis.title = element_blank()
+  ) +
+  ggtitle("Number of People Affected by Flood in Jakarta (2020)") 
+positivecase_map
+
+ggsave("positivecase_map.jpg", positivecase_map, width = 8, height = 6)
+
+#code source: (OpenAI, 2024)
+```
+
+### 4.1 Relative Risk Map
+```{r}
+#Relative Risk map
+library(ggspatial)
+
+RRPalette <- c(
+  "#65bafe",
+  "#89c9fe",
+  "#98cffe",
+  "#addbfd",
+  "#cbe6fe",
+  "#dfeffe",
+  "white",  
+  "#fed5d5",
+  "#fcbba1",
+  "#fc9272",
+  "#fb6a4a",
+  "#de2d26",
+  "#f0302b" 
+)
+
+
+relativerisk_map<-ggplot() + geom_sf(data = spatial.data, aes(fill =as.factor(RelativeRiskCat)), color = scales::alpha("black", 0.2), size = 1) +
+  geom_sf(data = jakarta_main, fill = NA, color = "black", size = 50, linetype = "solid") +
+  geom_sf_text(data = jakarta_main, aes(label = NAME_2), size = 4.5, color = "black", fontface = "bold")+
+  scale_fill_manual(
+    values = setNames(colorRampPalette(RRPalette)(13), as.character(-4:8)),
+    name = "Relative Risk", 
+    labels =  c("-4" = "0 - 0.25", "-3" = "0.25 - 0.50", "-2" = "0.50 - 0.75", 
+               "-1" = "0.75 - 1", "0" = "1.00 - 1.01", "1" = "1.01 - 1.10",
+               "2" = "1.10 - 1.25", "3" = "1.25 - 1.50", "4" = "1.50 - 1.75",
+               "5" = "1.76 - 2.00", "6" = "2.00 - 2.25", "7" = "2.25 - 2.50", "8" = ">2.5")
+  ) +
+  annotation_scale(
+    location = "bl",  
+    width_hint = 0.5  
+  ) +
+  annotation_north_arrow(
+    location = "bl",  
+    which_north = "true", 
+    pad_x = unit(0.8, "cm"),  
+    pad_y = unit(0.8, "cm"),  
+    style = north_arrow_fancy_orienteering 
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 13, hjust = 0.5, face = "bold"), 
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 11),
+    legend.position = "right", 
+    legend.key.size = unit(0.8, "cm"),
+    axis.title = element_blank()
+  ) +
+  ggtitle("Relative Risk of Flood-Affected Population") 
+relativerisk_map
+
+ggsave("relativerisk_map.jpg", relativerisk_map, width = 8, height = 6)
+
+#code source: (OpenAI, 2024)
+```
+
+### 4.2 Significance Map
+```{r}
+#Significance map
+
+significance_map<-ggplot() + geom_sf(data = spatial.data, aes(fill = as.factor(Significance)), color = scales::alpha("black", 0.2), size = 1) +
+  geom_sf(data = jakarta_main, fill = NA, color = "black", size = 50, linetype = "solid") +
+  geom_sf_text(data = jakarta_main, aes(label = NAME_2), size = 4.5, color = "black", fontface = "bold")+
+  scale_fill_manual(
+    values = c("-1" = "#4d94ff",  # Blue for Significant Decrease
+               "0" = "#f0f0f0",   # Gray for Not Significant
+               "1" = "#de2d26"),  # Red for Significant Increase
+    name = "Significance Categories",
+    labels = c("-1" = "Significant Decrease", "0" = "Not Significant", "1" = "Significant Increase")
+  ) +
+  annotation_scale(
+    location = "bl",  
+    width_hint = 0.5  
+  ) +
+  annotation_north_arrow(
+    location = "bl",  
+    which_north = "true", 
+    pad_x = unit(0.8, "cm"),  
+    pad_y = unit(0.8, "cm"),  
+    style = north_arrow_fancy_orienteering 
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 13, hjust = 0.5, face = "bold"), 
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 11),
+    legend.position = "right", 
+    legend.key.size = unit(0.8, "cm"),
+    axis.title = element_blank()
+  ) +
+  ggtitle("Relative Risk Significance Map") 
+significance_map
+
+
+ggsave("significance_map.jpg", significance_map, width = 8, height = 6)
+
+#code source: (OpenAI, 2024)
+```
+
+### 4.3 Exceedance Probabilities
+```{r}
+#Exceedance Probabilities map
+library(scales)
+
+spatial.data$ProbCat <- factor(spatial.data$ProbCat, levels = as.character(1:4))
+
+spectral_palette <- colorRampPalette(c("#f7fbff", "#ff1a1a"))(4)
+
+exceedance_probabilities_map<-ggplot() + geom_sf(data = spatial.data, aes(fill =ProbCat), color = scales::alpha("black", 0.2), size = 1) +
+  geom_sf(data = jakarta_main, fill = NA, color = "black", size = 50, linetype = "solid") +
+  geom_sf_text(data = jakarta_main, aes(label = NAME_2), size = 4.5, color = "black", fontface = "bold")+
+  scale_fill_manual(
+    values = setNames(colorRampPalette(spectral_palette)(4), as.character(1:4)),  # Red for Significant Increase
+    name = "Exceedance Probability",
+    labels = c("1" = "0 - 0.01", "2" = "0.01 - 0.50", "3" = "0.50 - 1.00", "4" = "1.0")
+  ) +
+  annotation_scale(
+    location = "bl",  
+    width_hint = 0.5  
+  ) +
+  annotation_north_arrow(
+    location = "bl",  
+    which_north = "true", 
+    pad_x = unit(0.8, "cm"),  
+    pad_y = unit(0.8, "cm"),  
+    style = north_arrow_fancy_orienteering 
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 13, hjust = 0.5, face = "bold"), 
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 11),
+    legend.position = "right", 
+    legend.key.size = unit(0.8, "cm"),
+    axis.title = element_blank()
+  ) +
+  ggtitle("Exceedance Probabilities") 
+exceedance_probabilities_map
+
+ggsave("exceedance_probabilities_map.jpg", exceedance_probabilities_map, width = 8, height = 6)
+
+#code source: (OpenAI, 2024)
+```
+```{r}
+exceedance_summary <- spatial.data %>%
+  group_by(NAME_2) %>%
+  summarise(
+    rr_above_1_3 = sum(rr > 1.3, na.rm = TRUE),
+    significant = sum(Significance > 0, na.rm = TRUE),
+    excProb_sig = sum(excProb > 0.5 & Significance > 0, na.rm = TRUE)
+  ) %>%
+  arrange(desc(excProb_sig))
+
+# View the result
+print(exceedance_summary)
+```
+## Limitation
+In this study, the author found that the global estimate of relative risk for flood-affected populations in Jakarta in 2020, as modeled using the BYM ICAR approach, was 0.03 (or 97.67% from the baseline). This is particularly notable given that 2020 recorded the highest number of people affected by floods. However, the study has several limitations. 
+
+First limitation is that the dependent and independent variables were sourced from official datasets published by Indonesian government agencies. These sources are known to contain inconsistencies, which may limit the accuracy and reliability of the findings (Rachmat et al., 2024; Tjondronegoro et al., 2022). Second, the analysis is limited to the year 2020 and focuses only on global statistics. Future research could benefit from the use of Bayesian model updating or spatio-temporal models to assess changes in flood risk over time, as 2020 may represent an outlier. Additionally, spatially varying coefficient models (Meehan et al., 2024; Gelfand et al., 2003) could help capture local relationships between variables, particularly since this study identified wards with high relative risk not reflected in global estimates. Third, several known confounding factors such as distance to rivers, rainfall intensity, elevation, and land use were not included in the model (Lin & Billa, 2021; Erhardt, Boudreault, & Carozza, 2022; Yusya, Septyandy, & Indra, 2020). Finally, due to the use of aggregated ward-level data, the results may be subject to ecological bias. For example, a ward identified as high-risk may only contain a small high-risk area near a river, while the remainder of the ward may have significantly lower risk.
+
+Despite these limitations, this research serves as an important exploratory analysis, offering insight into spatial patterns of flood risk in Jakarta and laying the groundwork for future research and policy development.
+
+
+## Reference
+
+Ban, J., Sutton, C., Ma, Y., Lin, C. and Chen, K. (2023). Association of flooding exposure with cause-specific mortality in North Carolina, United States. Nature Water, 1(12), pp.1027–1034. doi:https://doi.org/10.1038/s44221-023-00167-5.
+
+Duncan, E.W., White, N.M. and Mengersen, K. (2017). Spatial smoothing in Bayesian models: a comparison of weights matrix specifications and their impact on inference. International Journal of Health Geographics, 16. doi:https://doi.org/10.1186/s12942-017-0120-x.
+
+Erhardt, R.J., Boudreault, M. and Carozza, D.A. (2022). Climate, Spatial Dependence, and Flood Risk: A U.S. Case Study. Casualty Actuarial Society.
+
+Gatra, S. (2020). 170 KK di Bidara Cina Terdampak Banjir, Genangan Sempat Setinggi 1,5 Meter. [online] KOMPAS.com. Available at: https://megapolitan.kompas.com/read/2020/10/05/12213501/170-kk-di-bidara-cina-terdampak-banjir-genangan-sempat-setinggi-15-meter [Accessed 21 Apr. 2025].
+
+Gelfand, A.E., Kim, H.-J., Sirmans, C.F. and Banerjee, S. (2003). Spatial Modeling With Spatially Varying Coefficient Processes. Journal of the American Statistical Association, 98(462), pp.387–396. doi:https://doi.org/10.1198/016214503000170.
+
+Gelman, A. (2025). Prior Choice Recommendations. [online] Github. Available at: https://github.com/stan-dev/stan/wiki/prior-choice-recommendations.
+
+Keefe, M.J., Ferreira, M.A.R. and Franck, C.T. (2018). On the formal specification of sum-zero constrained intrinsic conditional autoregressive models. Spatial Statistics, 24, pp.54–65. doi:https://doi.org/10.1016/j.spasta.2018.03.007.
+
+Law, J. (2016). Exploring the Specifications of Spatial Adjacencies and Weights in Bayesian Spatial Modeling with Intrinsic Conditional Autoregressive Priors in a Small-area Study of Fall Injuries. AIMS Public Health, 3(1). doi:https://doi.org/10.3934/publichealth.2016.1.65.
+
+Lemoine, N.P. (2019). Moving beyond noninformative priors: why and how to choose weakly informative priors in Bayesian analyses. Oikos, 128(7), pp.912–928. doi:https://doi.org/10.1111/oik.05985.
+
+Li, L., Musah, A., Thomas, M.G. and Kostkova, P. (2022). An ecological study exploring the geospatial associations between socioeconomic deprivation and fire-related dwelling casualties in the England (2010–2019). Applied Geography, 144. doi:https://doi.org/10.1016/j.apgeog.2022.102718.
+
+Lin, J.M. and Billa, L. (2021). Spatial prediction of flood-prone areas using geographically weighted regression. Environmental Advances, 6. doi:https://doi.org/10.1016/j.envadv.2021.100118.
+
+MacLachlan, A. and Dennett, A. (2022). An Applied Geographic Information Systems and Science Course in R. Journal of Open Source Education, 5(50), pp.141–141. doi:https://doi.org/10.21105/jose.00141.
+
+Morris, M., Wheeler-Martin, K., Simpson, D., Mooney, S.J., Gelman, A. and DiMaggio, C. (2019). Bayesian hierarchical spatial models: Implementing the Besag York Mollié model in stan. Spatial and Spatio-temporal Epidemiology, 31. doi:https://doi.org/10.1016/j.sste.2019.100301.
+
+Musah, A. (2025a). BAYESIAN SPATIAL RISK MODELLING. UCL Department of Geography.
+
+Musah, A. (2025b). GEOG0125: Advanced Topics in Social Geographic Data Science. [online] GEOG0125: Advanced Topics in Social Geographic Data Science. Available at: https://uclpg-msc-sgds.github.io/GEOG0125/bayesian-spatial-modelling-for-areal-data-in-stan.html.
+
+Nayak, M.A., Cowles, M.K., Villarini, G. and Wafa, B.U. (2020). Bayesian Hierarchical Models for the Frequency of Winter Heavy Precipitation Events Over the Central United States: The Role of Atmospheric Rivers. Water Resources Research, 56(11). doi:https://doi.org/10.1029/2020wr028256.
+
+OpenAI (2024). I have ‘y’ and ‘x’ in my y-axis and x-axis in this code "plot_overall<-ggplot(). [online] ChatGPT (December 23, 2024 Version). Available at: https://chatgpt.com/c/6772c89a-cbb8-800a-b8ec-f2f92997196d [Accessed 23 Dec. 2024].
+
+OpenAI (2025). that is from ‘mutate(area = st_area(geometry))%>% mutate(pop_density = Total.Population/area)’ and I want to remove the units and make it km2. [online] ChatGPT (April, 23 2025 Version). Available at: https://chatgpt.com/c/67deb461-6ae8-800a-82bf-e65f927ebe4f.
+
+Prabowo, D. and Meiliana, D. (2020). Ketua RW 03 Cipinang Melayu: Banjir Kali Ini Paling Besar dan Dua Kali. [online] KOMPAS.com. Available at: https://nasional.kompas.com/read/2020/02/25/15425101/ketua-rw-03-cipinang-melayu-banjir-kali-ini-paling-besar-dan-dua-kali#google_vignette [Accessed 22 Dec. 2025].
+
+Quick, H., Song, G. and Tabb, L.P. (2021). Evaluating the informativeness of the Besag-York-Mollié CAR model. Spatial and Spatio-temporal Epidemiology, 37. doi:https://doi.org/10.1016/j.sste.2021.100420.
+
+Rachmat, D.F., Mulyadi, D., Abdullah, S., Putrianti, S.D. and Nurliawati, R. (2024). Analysis of the Governance of One Data Indonesia (SDI) at the Communication and Information Office of Sukabumi City. In: In Fourth International Conference on Administrative Science (ICAS 2022). Atlantis Press, pp.42–60. doi:https://doi.org/10.2991/978-2-38476-104-3_6.
+
+Tempo (2020). Sodetan Kali Sunter Sudah Jadi, Cipinang Melayu Bebas Banjir. [online] Tempo. Available at: https://www.tempo.co/arsip/sodetan-kali-sunter-sudah-jadi-cipinang-melayu-bebas-banjir--576403 [Accessed 22 Apr. 2025].
+
+Tjondronegoro, D., Liew, A.W.-C., Verhelst, T., Green , D., Bernot , A., Hasan , R. and Rifai , B. (2022). The state of open data implementation in Indonesia. Regional Outlook Paper.Wang, G. (2022). Laplace approximation for conditional autoregressive models for spatial data of diseases. MethodsX, 9. doi:https://doi.org/10.1016/j.mex.2022.101872.
+
+Yusya, R.R., Septyandy, M.R. and Indra, T.L. (2020). Flood Risk Mapping of Jakarta Using Genetic Algorithm Rule-Set Production (GARP) and Quick Unbiased Efficient Statistical Tree (QUEST) Methods. In: IOP Conference Series: Materials Science and Engineering.
