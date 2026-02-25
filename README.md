@@ -22,7 +22,6 @@ The objective is to provide probabilistic, spatially explicit risk assessment to
 ## Research Objectives
 
 - Estimate the spatial distribution of flood-affected populations.
-- Identify high-risk clusters while accounting for spatial autocorrelation.
 - Quantify uncertainty using Bayesian posterior distributions.
 - Generate exceedance probability maps for risk-based decision-making.
 
@@ -79,7 +78,7 @@ By incorporating spatial structure and uncertainty, the BYM model provides more 
 
 ## Tools
 
-R · Bayesian spatial modelling · BYM model · Spatial epidemiology · GIS analysis · INLA / spatial regression
+R · Bayesian spatial modelling · BYM model · GIS analysis · INLA / spatial regression
 
 ---
 
